@@ -46,5 +46,5 @@ This mod started because I played the Tree Grazer event and thought those upgrad
 
 - Thanks to https://github.com/ats-mods/ModTemplate for the mod template
 - Thanks to https://github.com/JoyfulShush/AtS-my-first-mod/ with the really helpful guide
-- Thanks to https://github.com/JamesVeug/Josiwe.ATS.Cheats/ for all the really good examples for all the difference things you can do.
+- Thanks to https://github.com/JamesVeug/Josiwe.ATS.Cheats/ for all the really good examples for all the different things you can do.
 - Thanks to Eremite Games for making Against the Storm.

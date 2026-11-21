@@ -24,17 +24,24 @@ namespace CampsUpgrade
     ///   2. Text: the copied perks get their own names and descriptions, so the UI reads correctly (CustomTexts).
     ///   3. UI:   the gatherer/fishing panels have no upgrades tab, so copy the camp panel's (AddUpgradesUi).
     /// </summary>
+    // [HarmonyPatch] on the class tells Harmony (the runtime patching library) that this class contains patch methods.
+    // Harmony rewrites game methods at runtime so ours runs before/after them, without editing the game's DLL.
+    // [BepInPlugin] gives BepInEx (the mod loader) the mod's id, name and version; BaseUnityPlugin makes it a Unity
+    // MonoBehaviour, so Unity creates it at startup and calls Awake().
     [HarmonyPatch]
     [BepInPlugin(PluginInfo.PLUGIN_GUID, PluginInfo.PLUGIN_NAME, PluginInfo.PLUGIN_VERSION)]
     public class Plugin : BaseUnityPlugin
     {
         public static ManualLogSource Log;
-        private Harmony harmony;
+        private static ConfigEntry<bool> DebugLog;
 
         // The building whose upgrades are copied to all the others.
         private const string SourceBuildingName = "Woodcutters Camp";
 
         // The buildings that receive those upgrades (the model "Name", not the display name).
+        // The Woodcutters Camp is a CampModel; the gatherer huts and fishing huts are other model classes
+        // (GathererHutModel, FishingHutModel). All three extend UpgradableBuildingModel, which is what holds "levels".
+        // Some buildings have a separate "Primitive ..." model with its own name, so both names are listed.
         private static readonly string[] TargetBuildingNames =
         {
             "Forager's Camp",
@@ -54,12 +61,27 @@ namespace CampsUpgrade
         private static readonly Dictionary<string, ConfigEntry<bool>> UpgradeEnabled =
             new Dictionary<string, ConfigEntry<bool>>();
 
+        // Unity calls Awake() once when the plugin object is created, before the game's own startup finishes.
+        // Logger and Config are provided by BaseUnityPlugin.
         private void Awake()
         {
             Log = Logger;
+
+            DebugLog = Config.Bind(
+                "DebugLog",
+                "DebugLog",
+                false,
+                "If true, add the gi logs to bepinex log window");
+
             BindConfigs();
-            harmony = Harmony.CreateAndPatchAll(typeof(Plugin));
+            // Scans this class for [HarmonyPatch] methods and applies them all.
+            Harmony.CreateAndPatchAll(typeof(Plugin));
             Log.LogInfo($"{PluginInfo.PLUGIN_NAME} v{PluginInfo.PLUGIN_VERSION} loaded");
+        }
+
+        private static void DebugInfo(string message)
+        {
+            if (DebugLog.Value) Log.LogInfo(message);
         }
 
         private void BindConfigs()
@@ -70,7 +92,7 @@ namespace CampsUpgrade
                     "Buildings",
                     ConfigKey(name),
                     true,
-                    "If true, this building can be upgraded. Takes effect the next time the game starts.");
+                    "If true, this building can be upgraded. Takes effect the next time the game starts. This is for the small version of the building as well");
             }
         }
 
@@ -87,10 +109,17 @@ namespace CampsUpgrade
         // The game only enables camp upgrades when the CampsUpgradesActivationModel effect has set
         // EffectsState.campsUpgradesActive (global, affects ALL camps). UpgradableBuilding.HasUpgrades
         // calls CampModel.AreUpgradesUnlockd(), so we force it true for the woodcutters camp only.
+        //
+        // Harmony postfix: runs right after the original method. Special parameter names are filled in by Harmony:
+        //   __instance = the object the method was called on (the CampModel)
+        //   __result   = the original return value; "ref" lets us change what the caller receives
         [HarmonyPatch(typeof(CampModel), nameof(CampModel.AreUpgradesUnlockd))]
         [HarmonyPostfix]
         private static void AllowWoodcutterUpgrades(CampModel __instance, ref bool __result)
         {
+            // AreUpgradesUnlockd is a virtual method on UpgradableBuildingModel, and CampModel overrides it. This patch
+            // targets the CampModel override, so it only sees camps (GathererHutModel and FishingHutModel do not
+            // override it). Matching on the name then picks out the woodcutters among the camps.
             if (!__result && __instance.Name.Contains("Woodcutter") && IsUpgradeEnabled(SourceBuildingName))
                 __result = true;
         }
@@ -105,6 +134,7 @@ namespace CampsUpgrade
         private static bool upgradesCopied;
 
         // Runs once the game has finished loading, before any match. All building models exist by then.
+        // OnServicesReady is not public, so it is targeted by its name as a string (nameof would not compile).
         [HarmonyPatch(typeof(MainController), "OnServicesReady")]
         [HarmonyPostfix]
         private static void OnServicesReady()
@@ -114,6 +144,8 @@ namespace CampsUpgrade
         }
 
         // Lets the game find the text for our custom keys.
+        // The game's UI looks text up by a key (LocaText.key) through TextsService. Our keys are not in the game's
+        // text tables, so after the normal lookup we replace the result whenever the key is one of ours.
         [HarmonyPatch(typeof(TextsService), nameof(TextsService.GetLocaText))]
         [HarmonyPostfix]
         private static void CustomLocaText(string key, ref string __result)
@@ -127,38 +159,40 @@ namespace CampsUpgrade
             if (upgradesCopied) return;
             upgradesCopied = true;
 
-            var allBuildings = Serviceable.Settings.Buildings;
+            // One pass over the game's buildings instead of one scan per target.
+            var upgradable = new Dictionary<string, UpgradableBuildingModel>();
+            foreach (var b in Serviceable.Settings.Buildings.OfType<UpgradableBuildingModel>())
+            {
+                if (!upgradable.ContainsKey(b.Name))
+                    upgradable.Add(b.Name, b);
+            }
 
-            // DEBUG: every upgradable building the game has, to check the TargetBuildingNames against.
-            foreach (var b in allBuildings.OfType<UpgradableBuildingModel>())
-                Log.LogInfo($"[Debug] upgradable model: Name='{b.Name}' type={b.GetType().Name} levels={b.levels?.Length}");
-
-            var source = allBuildings.OfType<CampModel>().FirstOrDefault(b => b.Name == SourceBuildingName);
-            if (source?.levels == null)
+            if (!upgradable.TryGetValue(SourceBuildingName, out var model) ||
+                !(model is CampModel source) || source.levels == null)
             {
                 Log.LogWarning($"{PluginInfo.PLUGIN_NAME} upgrades not copied: '{SourceBuildingName}' not found");
                 return;
             }
 
+            // Built once and shared: every target building gets the same levels array (and so the same perk objects).
             var levels = CreateLevelsFrom(source);
 
             foreach (var name in TargetBuildingNames)
             {
                 if (!IsUpgradeEnabled(name))
                 {
-                    Log.LogInfo($"{PluginInfo.PLUGIN_NAME} upgrades for '{name}' are disabled in the config, skipped");
+                    DebugInfo($"Upgrades for '{name}' are disabled in the config, skipped.");
                     continue;
                 }
 
-                var target = allBuildings.OfType<UpgradableBuildingModel>().FirstOrDefault(b => b.Name == name);
-                if (target == null)
+                if (!upgradable.TryGetValue(name, out var target))
                 {
                     Log.LogWarning($"{PluginInfo.PLUGIN_NAME} building '{name}' not found, skipped");
                     continue;
                 }
 
                 target.levels = levels;
-                Log.LogInfo($"{PluginInfo.PLUGIN_NAME} {target.Name} now has {levels.Length} upgrade levels copied from {source.Name}");
+                DebugInfo($"{target.Name} now has {levels.Length} upgrade levels copied from {source.Name}.");
             }
         }
 
@@ -186,12 +220,17 @@ namespace CampsUpgrade
 
         // The woodcutters' perks carry woodcutter wording, so we clone each perk and give the clone neutral text.
         // (The clone does the same thing as the original; only the name and description differ.)
+        //
+        // Perks are Unity ScriptableObjects (data assets loaded with the game). Object.Instantiate makes an independent
+        // in-memory copy, so changing the copy's text does not touch the woodcutters' original perk.
         private static BuildingPerkModel ClonePerk(BuildingPerkModel original, int level, int perkIndex)
         {
             var clone = UnityEngine.Object.Instantiate(original);
+            // "name" is Unity's built-in object name (used in the editor/debugging); "Name" used elsewhere is the game model's own property.
             clone.name = $"{original.Name} (copy)";
 
             GetPerkText(original, out var displayName, out var description);
+            // Unique key per level/perk slot (e.g. CampsUpgrade_L0_1_Name); CustomLocaText above resolves these.
             var nameKey = $"CampsUpgrade_L{level}_{perkIndex}_Name";
             var descriptionKey = $"CampsUpgrade_L{level}_{perkIndex}_Desc";
             CustomTexts[nameKey] = displayName;
@@ -204,6 +243,8 @@ namespace CampsUpgrade
         }
 
         // Placeholder wording. The numbers come from the woodcutters' perks (speed +25%, capacity 3, extra production 33%).
+        // Picks the text by the perk's concrete C# type (pattern-matching switch; "case X name" also casts to X so we
+        // can read its fields, "case X _" just checks the type).
         private static void GetPerkText(BuildingPerkModel perk, out string displayName, out string description)
         {
             switch (perk)
@@ -225,7 +266,7 @@ namespace CampsUpgrade
 
                 case AutomatonBuildingPerkModel automaton:
                     displayName = "Storage Automaton";
-                    description = $"Adds {automaton.amount} automaton to this building.";
+                    description = $"Adds {automaton.amount} hauling cart to this building. That will take the good back to the warehouse.";
                     break;
 
                 default:
@@ -243,6 +284,15 @@ namespace CampsUpgrade
         // The panels are scene singletons that only exist once a match has loaded, so this runs from
         // GameController.StartGame (after the match's services are loaded, before the player can click anything).
 
+        // Unity UI vocabulary used below:
+        //   Transform  = a GameObject's position in the scene hierarchy (parent/children). Every UI element has one.
+        //   Find("A/B")= looks up a child by its hierarchy path, relative to that transform; returns null if missing.
+        //   Instantiate(x, parent) = clones x (and all its children and components) and attaches the clone under parent.
+        //   SiblingIndex = order among the parent's children; for UI layouts it sets the order the elements appear in.
+        //   GetComponent<T>() = gets the script/component of type T attached to that GameObject.
+        // The path strings ("Content/TabsPanel/Upgrades" etc.) are the names in the game's UI prefabs, so they can
+        // break if the game renames them (hence the null checks and warning log).
+
         // The upgrades tab we added to each panel.
         private static readonly Dictionary<ProductionBuildingPanel, AnimatedTab> UpgradeTabs =
             new Dictionary<ProductionBuildingPanel, AnimatedTab>();
@@ -252,7 +302,13 @@ namespace CampsUpgrade
         private static void OnGameStart()
         {
             try
-            {
+            {   
+                
+                // Three separate building panels exist, matching the three model classes:
+                //   CampPanel        - camps such as the Woodcutters Camp; has the upgrades tab we copy from
+                //   GathererHutPanel - gatherer huts; no upgrades tab, so we add one
+                //   FishingHutPanel  - fishing huts; no upgrades tab, so we add one
+                // Gatherer and fishing huts use different panels, so each needs its own call.
                 AddUpgradesUi(GathererHutPanel.Instance);
                 AddUpgradesUi(FishingHutPanel.Instance);
             }
@@ -274,13 +330,11 @@ namespace CampsUpgrade
             UpdateUpgradesTab(__instance, hut);
         }
 
+        // The second argument of [HarmonyPatch] lists the parameter types, to pick the right overload of Show.
+        // SwitchTab(tab, bool) shows or hides that tab.
         private static void UpdateUpgradesTab(ProductionBuildingPanel panel, Building building)
         {
-            var hasTab = UpgradeTabs.TryGetValue(panel, out var tab);
-            // DEBUG: why a building does or does not show the tab.
-            Log.LogInfo($"[Debug] panel shown: building='{building.BuildingModel.Name}' hasUpgrades={building.HasUpgrades} " +
-                        $"levels={(building.BuildingModel as UpgradableBuildingModel)?.levels?.Length} tabAdded={hasTab}");
-            if (hasTab)
+            if (UpgradeTabs.TryGetValue(panel, out var tab))
                 panel.tabsPanel.SwitchTab(tab, building.HasUpgrades);
         }
 
@@ -313,17 +367,21 @@ namespace CampsUpgrade
             tabObject.name = campTab.name;
             tabObject.SetSiblingIndex(1);
             var tab = tabObject.GetComponent<AnimatedTab>();
+            // The cloned tab still points at the camp panel's upgrades panel (references survive the clone),
+            // so repoint it at our copy. toEnable is the list of things the tab turns on when clicked.
             tab.toEnable = new[] { upgradesPanel.GetComponent<ActivationLock>() };
 
             // Register the tab with the panel's tab bar and the panel with the building panel.
+            // tabs is an array, so build a list, insert, and assign a new array back.
             var tabs = panel.tabsPanel.tabs.ToList();
             tabs.Insert(1, tab);
             panel.tabsPanel.tabs = tabs.ToArray();
+            // SetUp wires the tab's click to the tab bar's handler (the clone's was wired to the camp panel's bar).
             tab.SetUp(panel.tabsPanel.OnTabClicked);
 
             panel.upgradesPanel = upgradesPanel.GetComponent<BuildingUpgradesPanel>();
             UpgradeTabs[panel] = tab;
-            Log.LogInfo($"{PluginInfo.PLUGIN_NAME} added upgrades tab and panel to {panel.GetType().Name}");
+            DebugInfo($"Added upgrades tab and panel to {panel.GetType().Name}.");
         }
 
         #endregion

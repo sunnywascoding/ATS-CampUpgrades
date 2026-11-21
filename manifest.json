@@ -1,7 +1,7 @@
 {
     "name": "CampsUpgrade",
     "version_number": "1.0.0",
-    "website_url": "https://github.com/sunnywascoding/ATS-BuildableEventBuildings",
+    "website_url": "https://github.com/sunnywascoding/ATS-CampUpgrades",
     "description": "Against the Storm mod to enable upgrades for Woodcutter Camp and other gatherer camps",
     "dependencies": [
                         "BepInEx-BepInExPack-5.4.2305"
